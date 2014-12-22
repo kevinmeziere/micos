@@ -1,0 +1,303 @@
+#!/usr/bin/bash
+
+set -x trace
+
+PATH=/usr/sbin:/usr/bin
+export PATH
+
+oldcwd=`pwd`
+cd /micos/bin
+
+. ./common.sh
+
+MICOS_HOME=/micos
+MICOS_EXTRA=$MICOS_HOME/mnt/micos-extra
+NODE=/usr/node/bin/node
+
+# globals
+pxeZoneUUID=
+gzNicAdminIp=
+
+live_media=
+live_media_path=
+
+net0_nic=
+net0_ip=
+net0_netmask=
+net0_gateway=
+vm_mem=
+vm_quota=
+root_shadow=
+dhcp_iprange_start=
+dhcp_iprange_end=
+
+micosPxeDetectDhcpServer()
+{
+  echo "Try to sniff dhcp servers in your network, be patient..."
+  micosGetAdminNicMac
+  local mac="$val"
+  val=$($NODE dhcpdetect.js "$mac" 5 2>/dev/null) # if true, val will be "detected"
+  echo "Done."
+}
+
+micosPxePrepareResources()
+{
+  echo "Start preparing resources in $MICOS_EXTRA ... "
+  mkdir -p $MICOS_EXTRA
+  if [ "$live_media" == "usb" ]; then
+    mount -F pcfs ${live_media_path/rdsk/dsk}:c $MICOS_EXTRA
+  else # dvd
+    mount -F hsfs ${live_media_path/rdsk/dsk} $MICOS_EXTRA
+  fi
+  $NODE $MICOS_HOME/bin/simple-pkgsrc-repo.js $MICOS_EXTRA/micos/pxe 8082 &
+  echo $! >$MICOS_HOME/var/repo-pxe.pid
+  echo "Done"
+}
+
+micosPxeCloseResources()
+{
+  if [ -f $MICOS_HOME/var/repo-pxe.pid ]; then
+    kill `cat $MICOS_HOME/var/repo-pxe.pid`
+  fi
+  umount $MICOS_EXTRA
+}
+
+micosPxeCreateVm()
+{
+  local vmconf=$1
+  echo "Create VM (This could take a while)..."
+  local result=`vmadm create -f $vmconf 2>&1`
+  if ! grep -q "Successfully" <<<$result; then
+    failAndExit "Oops, create fifo vm failed, that's something!"
+  fi
+  pxeZoneUUID=`echo $result | awk '{ print $NF; }'`
+  echo "Done"
+}
+
+micosPxeInstallPkg()
+{
+  micosGetAdminNicIp
+  gzNicAdminIp="$val"
+
+  zexec "echo \"http://release.project-fifo.net/pkg/rel/\" >>\"/opt/local/etc/pkgin/repositories.conf\""
+  zexec cp /opt/local/etc/pkgin/repositories.conf /opt/local/etc/pkgin/repositories.conf.bak
+  zexec "echo \"http://$gzNicAdminIp:8082\" >\"/opt/local/etc/pkgin/repositories.conf\""
+  zexec pkgin -y in tftp-hpa dnsmasq
+}
+
+micosPxeTftpSetup()
+{
+  echo "Setup PXE zone tftp..."
+
+  zexec mkdir /tftpboot
+  zexec "echo \"tftp dgram udp wait root /opt/local/sbin/in.tftpd in.tftpd -s /tftpboot\" > /tmp/tftp.inetd"
+  zexec svcadm enable inetd
+  micosVerifySvc inetd
+
+  zexec "inetconv -i /tmp/tftp.inetd -o /tmp"
+  zexec svccfg import /tmp/tftp-udp.xml
+  zexec svcadm restart tftp/udp
+  micosVerifySvc tftp/udp
+
+  echo "All done."
+}
+
+micosPxeDnsmasqSetup()
+{
+  echo "Setup PXE zone dnsmasq..."
+
+  local tmpjsondata=/tmp/dnsmasq-conf-`date +%s`.data
+  rm -rf $tmpjsondata
+
+  # gendata
+  echo "{" >>$tmpjsondata
+  echo "\"dhcpRange\": \"$dhcp_iprange_start,$dhcp_iprange_end,2h\"" >>$tmpjsondata
+  echo "}" >> $tmpjsondata
+
+  zexec cp /opt/local/etc/dnsmasq.conf /opt/local/etc/dnsmasq.conf.old
+  cat $tmpjsondata | $NODE doTool.js ../share/pxe/dnsmasq.conf >/zones/$pxeZoneUUID/root/opt/local/etc/dnsmasq.conf
+  zexec svcadm enable dnsmasq
+  micosVerifySvc dnsmasq
+
+  echo "All done."
+}
+
+micosPxeCopyFiles()
+{
+  echo "Copy files into PXE zone..."
+  local extraPath=$1
+  local uuid=$2
+  cp /micos/share/pxe/pxegrub /zones/$uuid/root/tftpboot
+  rsync -avz $extraPath/platform /zones/$uuid/root/tftpboot/
+  rsync -avz $extraPath/boot /zones/$uuid/root/tftpboot/
+  zexec chown -R root:root /tftpboot/*
+  echo "All done."
+}
+
+micosPxeWelcome()
+{
+  local message="
+This wizard will help you to setup a PXE Zone to boot other servers.
+
+You must answer some questions to help us build the PXE Zone configuration.
+
+You will have a chance to review and correct your answers, as well as a chance to edit the final configuration, before it is applied.
+
+Would you like to continue to setup?"
+  dlg --title "DogeOS: PXE Zone setup wizard" --yesno "$message" 0 0
+  micosTestCancelled $? "noconfirm"
+}
+
+micosPxeReview()
+{
+  local ret=
+  local message="Please verify that there inputs are correct:
+
+PXE Zone quota
+
+  Memory (in MB): $vm_mem
+  Disk (in GB): $vm_quota
+
+PXE Zone NIC configuration
+
+  NIC tag: $net0_nic
+  IP address: $net0_ip
+  Netmask: $net0_netmask
+  Gateway: $net0_gateway
+
+DHCP Service configuration
+
+  Start IP: $dhcp_iprange_start
+  End IP: $dhcp_iprange_end
+"
+
+  dlg --yesno "$message" 30 60
+  ret=$?
+  if [ $ret -eq 0 ]; then
+    val=""
+  else
+    val="retry"
+  fi
+}
+
+micosPxeAskConfiguration()
+{
+  while [ /usr/bin/true ]; do
+    micosChooseNicTag "FiFo Zone"
+    net0_nic="$val"
+    micosSetNetIP "Set IP for the NIC of PXE Zone"
+    net0_ip="$val"
+    micosSetNetIP "Set Net Mask for the default NIC of FIFO zone" "$net0_netmask"
+    net0_netmask="$val"
+    micosSetNetIP "Set Gateway for the default NIC of FIFO zone" "$net0_gateway"
+    net0_gateway="$val"
+    micosSetNetIP "Set start Ip of your DHCP service" "$net0_gateway"
+    dhcp_iprange_start="$val"
+    micosSetNetIP "Set end IP of your DHCP service" "$net0_ip"
+    dhcp_iprange_end="$val"
+    vm_mem="64" # fix to be 64MB
+    vm_quota="2" # fix to be 2GB
+    micosSetRootPasswd "PXE Zone"
+    root_shadow="$val"
+    micosPxeReview
+    if [ -z "$val" ]; then
+      break
+    fi
+  done
+}
+
+micosPxeGenData()
+{
+  local datafile=$1
+  echo "{" >>$datafile
+  echo "\"max_physical_memory\":" $vm_mem >>$datafile
+  echo "," "\"quota\":" $vm_quota >>$datafile
+  echo "," "\"net0nictag\":" "\"$net0_nic\"" >>$datafile
+  echo "," "\"net0ip\":" "\"$net0_ip\"" >>$datafile
+  echo "," "\"resolvers\": [ \"8.8.8.8\", \"8.8.4.4\" ]" >>$datafile
+  echo "," "\"net0gateway\":" "\"$net0_gateway\"" >>$datafile
+  echo "," "\"net0netmask\":" "\"$net0_netmask\"" >>$datafile
+  echo "}" >>$datafile
+}
+
+micosPxeGenZoneConf()
+{
+  # generate zone configure data
+  local tmpdata=/tmp/pxejson-`date +%s`.data
+  rm -rf $tmpdata
+  touch $tmpdata
+  micosPxeGenData $tmpdata
+
+  # generate zone json
+  local tmpjson=/tmp/pxejson-`date +%s`.json
+  rm -rf $tmpjson
+  cat $tmpdata | $NODE doTool.js ../share/pxe/pxe-zone.json | json >$tmpjson
+
+  local message="Continue with following json configuration of PXE Zone ?
+
+  "$(cat $tmpjson | json)
+  dlg --yesno "$message" 30 60
+  if [ $? -ne 0 ]; then
+    exit $?
+  fi
+
+  val="$tmpjson"
+}
+
+# main guts start here
+
+micosCheckSysEnv 5
+
+micosGetGZNicInfo
+
+micosPxeDetectDhcpServer
+if [ "$val" == "detected" ]; then
+  dlg --msgbox "You probably already have another DHCP service in your network.
+
+There will be conflicts if you setup micos PXE server. Please resolve that before try again to setup the PXE server." 15 60
+  exit 1
+fi
+
+dlg_backtitle="DogeOS: Welcome!"
+
+micosPxeWelcome
+
+# decide the live media type
+micosFindLiveMediaType
+live_media=$val
+if [ $live_media == "smartdoge" ]; then
+  echo "PXE installer could only be used in DogeOS. Exiting."
+  exit 1
+fi
+micosDecideMediaDev $live_media
+live_media_path="$val"
+
+dlg_backtitle="DogeOS > PXE Zone: Network Configuration"
+
+micosPxeAskConfiguration
+
+dlg_backtitle="DogeOS > PXE Zone: Preparing to provision PXE Zone"
+
+micosPxeGenZoneConf
+pxe_zone_json="$val"
+
+micosPxePrepareResources
+micosImportImg "base64-14.2.0"
+micosFixJoyentManifest
+micosPxeCreateVm $pxe_zone_json
+
+setZexecUUID $pxeZoneUUID
+micosPxeInstallPkg
+micosPxeTftpSetup
+micosPxeDnsmasqSetup
+micosPxeCopyFiles $MICOS_EXTRA $pxeZoneUUID
+
+micosPxeCloseResources
+
+dlg_backtitle="DogeOS > PXE Zone: Congratulation!"
+
+dlg --msgbox "All done. PXE Zone is running alive now!
+
+You can turn on other servers in the same network to boot." 15 60
+
+cd $oldcwd

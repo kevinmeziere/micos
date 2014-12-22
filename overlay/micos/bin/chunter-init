@@ -1,0 +1,95 @@
+#!/usr/bin/bash
+
+set -o xtrace
+
+cd /micos/bin
+
+. ./common.sh
+. /lib/svc/share/smf_include.sh
+
+MICOSBIN=`pwd`
+
+NODE=/usr/node/bin/node
+
+val=
+
+install()
+{
+  # install chunter to /opt
+  echo2console "No chunter installed, now install it ..."
+  tmpd=/tmp/chunter-`date +%s`
+  rm -rf $tmpd
+  mkdir $tmpd
+  cd $tmpd
+  local CHUNTERFILE=$(ls ${MICOSBIN}/../share/fifo/chunter-*.gz)
+  local CHUNTERBASE=$(basename $CHUNTERFILE)
+  cp $CHUNTERFILE .
+  gunzip $CHUNTERBASE
+  sh ./${CHUNTERBASE%.*}
+  echo2console "Done with code " $?
+}
+
+startSvc()
+{
+  echo2console "Start chunter service ..."
+  svcadm enable epmd
+  svcadm enable chunter
+  echo2console "OK."
+}
+
+versionUpdated()
+{
+  # this only compare the chunter version in live with local installation
+  # $1 is live path of chunter.version
+  # $2 is local path of chunter.version
+  local v1="$(awk 'BEGIN { FS="," } { print $1 }' "$1")"
+  local v2="$(awk 'BEGIN { FS="," } { print $1 }' "$2")"
+  $NODE vercomp.js ${v1} ${v2}
+  local vercomp=$?
+  if [ $vercomp -eq 1 ]; then
+    val=""
+  else
+    val="updated"
+  fi
+}
+
+tryOnlineUpdate()
+{
+  echo2console "Try to reach release.project-fifo.net for online updates (this will take max 10 seconds)..."
+  ping release.project-fifo.net 10
+  if [ $? -ne 0 ]; then
+    echo2console "Reach timeout"
+    return
+  fi
+  echo2console "Reached, now update chunter ..."
+  /opt/chunter/bin/update
+  echo2console "Done."
+}
+
+# main
+echo2console "Checking chunter installation now..."
+if [ -f /opt/chunter/bin/chunter ]; then
+  echo2console "Found."
+  echo2console "Compare local chunter version with live media."
+  versionUpdated "/micos/share/fifo/chunter.version" "/opt/chunter/etc/chunter.version"
+  if [ -z $val ]; then
+    echo2console "Already newest, nothing to be updated."
+  else
+    # outdated, so move & install again
+    echo2console "Local is outdated, will update to live media version..."
+    mv /opt/chunter /opt/chunter-old-`date +%s`
+    install
+  fi
+else
+  install
+fi
+
+startSvc
+# diable this in default, since this may cause the system break
+# e.g., some running micos 0.4.5 vers rebooted after 0.6.0 released, may wrongly update
+# chunter to the latest (which will be 0.6.0), but not compatible to other fifo components
+# of 0.4.5
+# TOFIX: only update inside releases, maintain the usability
+#tryOnlineUpdate
+
+exit $SMF_EXIT_OK
